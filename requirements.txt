@@ -19,5 +19,5 @@ numpy
 yfinance
 scikit-learn
 tzdata
-xgbppst
+xgboost
 lightgbm
