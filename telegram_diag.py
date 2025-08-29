@@ -1,25 +1,24 @@
 # telegram_diag.py
-import os
-import requests
+import os, json, requests, sys
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+chat  = os.getenv("TELEGRAM_CHAT_ID", "")
+msg   = "✅ *Teste de diagnóstico do bot* — se você recebeu isso, o token e o chat_id estão OK."
 
-def send_test_message():
-    if not TOKEN or not CHAT_ID:
-        print("❌ ERRO: TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID não configurados no Railway.")
-        return
+if not token or not chat:
+    print("ERRO: TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID ausente.")
+    sys.exit(1)
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": "✅ Teste de notificação: seu bot do Railway está funcionando!",
-        "parse_mode": "Markdown"
-    }
+url = f"https://api.telegram.org/bot{token}/sendMessage"
+payload = {"chat_id": chat, "text": msg, "parse_mode": "Markdown"}
 
-    resp = requests.post(url, json=payload)
-    print("Status:", resp.status_code)
-    print("Resposta:", resp.text)
+r = requests.post(url, json=payload, timeout=15)
+print("Status:", r.status_code)
+try:
+    print("Resposta:", json.dumps(r.json(), ensure_ascii=False))
+except Exception:
+    print("Resposta bruta:", r.text)
 
-if __name__ == "__main__":
-    send_test_message()
+# sair com código !=0 se falhou (para aparecer claramente no deploy)
+if r.status_code != 200 or not r.json().get("ok"):
+    sys.exit(2)
