@@ -152,3 +152,21 @@ class Predictor:
             "signal": signal,
             "features_used": feature_cols,
         }
+         # --- compat: manter a API antiga usada pelo forex_web_app.py ---
+
+# Evita recarregar modelo a cada chamada
+_PREDICTOR_SINGLETON = None
+
+def _get_predictor_singleton():
+    global _PREDICTOR_SINGLETON
+    if _PREDICTOR_SINGLETON is None:
+        _PREDICTOR_SINGLETON = Predictor()
+    return _PREDICTOR_SINGLETON
+
+def predict_last(df):
+    """
+    Compat layer p/ web app.
+    Recebe um DataFrame e devolve o dicionário com sinal (igual ao Predictor.predict_from_df).
+    """
+    pred = _get_predictor_singleton()
+    return pred.predict_from_df(df)
