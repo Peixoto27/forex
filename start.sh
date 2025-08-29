@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-echo "[start.sh] role=${SERVICE_ROLE:-web} run=${RUN:-""} port=${PORT:-8080}"
+export PYTHONUNBUFFERED=1
+PORT="${PORT:-8080}"
 
-if [ "${RUN}" = "telegram_diag" ]; then
-  echo "[start.sh] Running telegram_diag.py"
-  python telegram_diag.py
-elif [ "${SERVICE_ROLE}" = "web" ]; then
-  echo "[start.sh] Starting gunicorn web"
-  exec gunicorn -w 2 -b 0.0.0.0:${PORT:-8080} forex_web_app:APP
+echo "[start.sh] iniciando web (gunicorn) na porta ${PORT}"
+gunicorn -w 2 -b 0.0.0.0:${PORT} forex_web_app:APP &
+WEB_PID=$!
+
+if [ "${ENABLE_RUNNER:-1}" = "1" ]; then
+  echo "[start.sh] iniciando runner.py em paralelo"
+  python runner.py &
+  RUN_PID=$!
 else
-  echo "[start.sh] Running runner.py"
-  python runner.py
+  echo "[start.sh] ENABLE_RUNNER=0 → runner desativado"
 fi
+
+# mantém o container vivo; se um dos dois morrer, o container reinicia
+wait -n $WEB_PID ${RUN_PID:-}
+exit $?
