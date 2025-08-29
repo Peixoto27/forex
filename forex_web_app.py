@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-API Flask (usada com Gunicorn).
-Ex.: gunicorn -w 2 -b 0.0.0.0:$PORT forex_web_app:APP
+API Flask (rodando no Railway).
+- / -> info
+- /healthz -> healthcheck
+- /api/forex/status -> status das configs
+- /api/forex/force-update -> roda predição + alerta no Telegram
 """
 
 import os
@@ -33,7 +36,7 @@ def status():
 
 @APP.get("/api/forex/force-update")
 def force_update():
-    # (opcional) proteção simples por key
+    # segurança simples via key
     need_key = os.getenv("FORCE_KEY", "")
     if need_key:
         if request.args.get("key") != need_key:
