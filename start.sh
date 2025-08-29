@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 set -e
 
-ROLE="${SERVICE_ROLE:-web}"
+echo "[start.sh] role=${SERVICE_ROLE:-web} run=${RUN:-""} port=${PORT:-8080}"
 
-if [ "$ROLE" = "web" ]; then
-  echo "[start.sh] role=web -> starting gunicorn"
-  exec gunicorn -w 2 -b 0.0.0.0:$PORT forex_web_app:APP
-elif [ "$ROLE" = "runner-test" ]; then
-  echo "[start.sh] role=runner-test -> python runner_test.py"
-  exec python runner_test.py
-elif [ "$ROLE" = "runner" ]; then
-  echo "[start.sh] role=runner -> python runner.py"
-  exec python runner.py
+if [ "${RUN}" = "telegram_diag" ]; then
+  echo "[start.sh] Running telegram_diag.py"
+  python telegram_diag.py
+elif [ "${SERVICE_ROLE}" = "web" ]; then
+  echo "[start.sh] Starting gunicorn web"
+  exec gunicorn -w 2 -b 0.0.0.0:${PORT:-8080} forex_web_app:APP
 else
-  echo "[start.sh] role=$ROLE not recognized -> default web"
-  exec gunicorn -w 2 -b 0.0.0.0:$PORT forex_web_app:APP
+  echo "[start.sh] Running runner.py"
+  python runner.py
 fi
