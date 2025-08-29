@@ -1,15 +1,15 @@
 # runner.py
 import os
 import time
+import json
 import logging
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-
 import requests
+from datetime import datetime
+from typing import List, Dict, Tuple
 
-from notifier_telegram import send_message  # usa seu módulo já existente
+from notifier_telegram import send_message  # <- usa o arquivo acima
 
-# ----------------- Config -----------------
+# -------- Config --------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -17,134 +17,160 @@ logging.basicConfig(
 )
 logger = logging.getLogger("runner")
 
-BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8080")  # gunicorn escuta em 8080
-FORCE_KEY = os.getenv("FORCE_KEY", "")
 RUN_INTERVAL_MIN = int(os.getenv("RUN_INTERVAL_MIN", "15"))
+CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.60"))
+SELECT_PER_CYCLE = int(os.getenv("SELECT_PER_CYCLE", "3"))
+SYMBOLS = os.getenv("SYMBOLS", "EURUSD=X,GBPUSD=X,USDJPY=X,BTC-USD")
+PERIOD = os.getenv("PERIOD", "3mo")
+INTERVAL = os.getenv("INTERVAL", "60m")
+FORCE_KEY = os.getenv("FORCE_KEY", "").strip()
 
-# Aceita 0.60 (fração) ou 60 (percentual)
-_thr = os.getenv("CONF_THRESHOLD", "0.60")
-try:
-    CONF_THRESHOLD = float(_thr)
-    if CONF_THRESHOLD <= 1:
-        CONF_THRESHOLD *= 100.0
-except Exception:
-    CONF_THRESHOLD = 60.0
+# Base URL do próprio serviço
+# 1) APP_BASE_URL (se você quiser setar manualmente)
+# 2) RAILWAY_PUBLIC_DOMAIN (quando disponível)
+# 3) http://127.0.0.1:PORT
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+PORT = os.getenv("PORT", "8080").strip()
 
-# Quantos sinais enviar por ciclo (0 = todos válidos)
-SELECT_PER_CYCLE = int(os.getenv("SELECT_PER_CYCLE", "0"))
+if APP_BASE_URL:
+    BASE = APP_BASE_URL.rstrip("/")
+elif RAILWAY_PUBLIC_DOMAIN:
+    BASE = f"https://{RAILWAY_PUBLIC_DOMAIN}".rstrip("/")
+else:
+    BASE = f"http://127.0.0.1:{PORT}"
 
-# ------------------------------------------
+API_FORCE = f"{BASE}/api/forex/force-update"
+API_STATUS = f"{BASE}/api/forex/status"
 
-def _format_msg(sig: Dict[str, Any]) -> str:
+# -------- Helpers --------
+def build_message(sig: Dict) -> str:
     """
-    Monta o texto pro Telegram a partir de um item de 'signals' do /force-update.
+    Monta texto em MarkdownV2 seguro (o send_message já escapa).
+    Espera chaves: symbol, side, price, take_profit, stop_loss, atr, confidence, time
     """
-    sym = sig.get("symbol")
-    side = str(sig.get("side") or "HOLD").upper()
+    sym = sig.get("symbol", "?")
+    side = (sig.get("side", "HOLD") or "HOLD").upper()
     price = sig.get("price")
     tp = sig.get("take_profit")
     sl = sig.get("stop_loss")
-    conf = float(sig.get("confidence") or 0.0)
+    atr = sig.get("atr")
+    conf = sig.get("confidence")
+    ts = sig.get("time") or datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    when = sig.get("time")
-    if not when:
-        when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # formata números com 5 casas (ou menos) para evitar notação científica
+    def fmt(x):
+        if x is None:
+            return "-"
+        try:
+            return f"{float(x):.5f}".rstrip("0").rstrip(".")
+        except:
+            return str(x)
 
     msg = (
-        "💱 **FOREX AI SIGNAL**\n"
-        f"**{sym}** → **{side}**\n"
-        f"Preço: `{price}`\n"
-        f"TP: `{tp}`  |  SL: `{sl}`\n"
-        f"Confiança: **{conf:.2f}%**\n"
-        f"🕒 {when}"
+        "💱 FOREX AI SIGNAL\n"
+        f"• Par: {sym}\n"
+        f"• Ação: {side}\n"
+        f"• Preço: {fmt(price)}\n"
+        f"• Take Profit: {fmt(tp)}\n"
+        f"• Stop Loss: {fmt(sl)}\n"
+        f"• ATR: {fmt(atr)}\n"
+        f"• Confiança: {fmt(conf*100 if isinstance(conf,(int,float)) else conf)}%\n"
+        f"• Horário: {ts}\n"
+        "_Aviso: Trading envolve risco\\._"
     )
     return msg
 
-def fetch_signals() -> List[Dict[str, Any]]:
+def fetch_signals() -> Tuple[bool, List[Dict], str]:
     """
-    Chama /api/forex/force-update (local) e devolve a lista 'signals'.
+    Puxa sinais do endpoint /api/forex/force-update?key=...
+    Retorna (ok, signals, info)
     """
-    url = f"{BASE_URL}/api/forex/force-update"
+    params = {}
     if FORCE_KEY:
-        url += f"?key={FORCE_KEY}"
+        params["key"] = FORCE_KEY
 
-    logger.info("Consultando sinais em: %s", url)
-    resp = requests.get(url, timeout=60)
-    logger.info("force-update -> %s", resp.status_code)
-    resp.raise_for_status()
+    try:
+        r = requests.get(API_FORCE, params=params, timeout=60)
+        if r.status_code != 200:
+            return False, [], f"HTTP {r.status_code}: {r.text}"
+        data = r.json()
+        sigs = data.get("signals") or []
+        return True, sigs, "ok"
+    except Exception as e:
+        return False, [], f"EXC fetch_signals: {e}"
 
-    data = resp.json()
-    signals = data.get("signals") or []
-    logger.info("Sinais recebidos: %d", len(signals))
-    return signals
-
-def pick_valid_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def filter_and_pick(sigs: List[Dict]) -> List[Dict]:
     """
-    Mantém apenas sinais com ok=true, side != HOLD e confiança >= threshold.
-    Ordena por confiança desc e corta se SELECT_PER_CYCLE > 0.
+    Mantém apenas sinais com ok==True e confiança >= CONF_THRESHOLD,
+    ordena por confiança desc e pega os top SELECT_PER_CYCLE.
     """
     valid = []
-    for s in signals:
+    for s in sigs:
+        ok_flag = bool(s.get("ok", False))
+        conf = s.get("confidence")
         try:
-            ok = bool(s.get("ok", False))
-            side = str(s.get("side") or "").upper()
-            conf = float(s.get("confidence") or 0.0)
+            conf_f = float(conf)
         except Exception:
-            continue
-
-        if ok and side in {"BUY", "SELL"} and conf >= CONF_THRESHOLD:
+            conf_f = 0.0
+        if ok_flag and conf_f >= CONF_THRESHOLD:
             valid.append(s)
 
-    valid.sort(key=lambda x: float(x.get("confidence") or 0.0), reverse=True)
+    valid.sort(key=lambda x: float(x.get("confidence", 0.0)), reverse=True)
+    return valid[:max(1, SELECT_PER_CYCLE)]
 
-    if SELECT_PER_CYCLE and SELECT_PER_CYCLE > 0:
-        valid = valid[:SELECT_PER_CYCLE]
-
-    logger.info("Sinais válidos p/ envio: %d", len(valid))
-    return valid
-
-def send_signals(signals: List[Dict[str, Any]]) -> int:
+def send_signals(sigs: List[Dict]) -> Tuple[int, int]:
     """
-    Envia cada sinal para o Telegram e retorna quantos foram enviados com sucesso.
+    Envia cada sinal como mensagem individual.
+    Retorna (enviados, falhas)
     """
-    sent = 0
-    for s in signals:
-        msg = _format_msg(s)
+    sent, fail = 0, 0
+    for s in sigs:
+        msg = build_message(s)
         ok, info = send_message(msg)
-        logger.info("Telegram resp: ok=%s info=%s", ok, info)
         if ok:
             sent += 1
-    return sent
+            logger.info(f"[telegram] enviado ✅ id={info.get('result',{}).get('message_id')}")
+        else:
+            fail += 1
+            logger.error(f"[telegram] erro ❌ {info}")
+    return sent, fail
 
-def run_once() -> int:
-    """
-    Executa um ciclo completo: baixa sinais, filtra e envia.
-    Retorna a quantidade enviada.
-    """
-    try:
-        all_signals = fetch_signals()
-        valid = pick_valid_signals(all_signals)
-        sent = send_signals(valid)
-        logger.info("Ciclo concluído: enviados=%d", sent)
-        return sent
-    except Exception as e:
-        logger.exception("Erro no ciclo do runner: %s", e)
-        return 0
+# -------- Loop --------
+def run_once() -> None:
+    logger.info("==== runner start ====")
+    logger.info(f"PERIOD={PERIOD} | INTERVAL={INTERVAL} | THR={CONF_THRESHOLD:.2f} | SYMBOLS={SYMBOLS}")
+    logger.info(f"API_FORCE={API_FORCE}")
 
-def main():
-    logger.info("==== runner iniciado ====")
-    logger.info("CONFIG: BASE_URL=%s | THR=%.2f%% | INTERVALO=%d min | SELECT=%d",
-                BASE_URL, CONF_THRESHOLD, RUN_INTERVAL_MIN, SELECT_PER_CYCLE)
-
-    # Se quiser rodar como cron do Railway, basta chamar uma vez e sair
-    if os.getenv("SERVICE_ROLE", "").lower() == "oneshot":
-        sent = run_once()
-        logger.info("Encerrando (oneshot). enviados=%d", sent)
+    ok, sigs, info = fetch_signals()
+    if not ok:
+        logger.error(f"fetch_signals falhou: {info}")
         return
 
-    # Loop contínuo
-    while True:
+    logger.info(f"Sinais recebidos: {len(sigs)}")
+    valid = filter_and_pick(sigs)
+    logger.info(f"Sinais válidos p/ envio: {len(valid)}")
+
+    s, f = send_signals(valid)
+    logger.info(f"Resumo envio -> enviados: {s} | falhas: {f}")
+
+def main():
+    role = os.getenv("SERVICE_ROLE", "web")
+    if role not in ("runner", "runner-test"):
+        logger.info(f"SERVICE_ROLE={role} (nada a fazer aqui)")
+        return
+
+    if role == "runner-test":
+        # Executa uma vez e sai (útil para disparo manual)
         run_once()
+        return
+
+    # runner tradicional com intervalo
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            logger.exception(f"Erro no ciclo do runner: {e}")
         time.sleep(RUN_INTERVAL_MIN * 60)
 
 if __name__ == "__main__":
