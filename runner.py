@@ -24,9 +24,13 @@ else:
     send_prediction_alerts = None
 
 PRED_FILE = os.getenv("PRED_FILE", "forex_predictions.json")
-SYMBOLS   = [s for s in os.getenv("SYMBOLS", "EURUSD=X,GBPUSD=X,USDJPY=X,BTC-USD").split(",") if s]
-INTERVAL  = os.getenv("INTERVAL", "1h")
-PERIOD    = os.getenv("PERIOD", "60d")
+SYMBOLS = os.getenv("SYMBOLS", "EURUSD=X,GBPUSD=X,USDJPY=X,BTC-USD").split(",")
+INTERVAL = os.getenv("INTERVAL", "60m")
+PERIOD   = os.getenv("PERIOD", "3mo")
+CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.60"))
+
+print(f"[runner] PERIOD={PERIOD} INTERVAL={INTERVAL} CONF_THRESHOLD={CONF_THRESHOLD}")
+print(f"[runner] SYMBOLS={SYMBOLS}")
 
 def write_predictions(preds: List[dict]):
     data = {"generated_at": datetime.now(timezone.utc).isoformat(), "predictions": preds}
