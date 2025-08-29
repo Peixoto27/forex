@@ -1,27 +1,37 @@
-# -*- coding: utf-8 -*-
-"""
-Envio para Telegram.
-Requer: TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID
-"""
+# notifier_telegram.py
+import os
+import re
+import requests
+from typing import Tuple, Any
 
-import os, requests
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-BOT = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-PARSE = os.getenv("TELEGRAM_PARSE_MODE", "")
+# Escapa caracteres especiais para parse_mode=MarkdownV2
+_MD_ESC = re.compile(r'([_*\[\]()~`>#+\-=|{}.!])')
 
-def send_message(text: str) -> bool:
-    if not BOT or not CHAT:
-        print("[telegram] missing env vars")
-        return False
-    url = f"https://api.telegram.org/bot{BOT}/sendMessage"
-    payload = {"chat_id": CHAT, "text": text}
-    if PARSE:
-        payload["parse_mode"] = PARSE
+def escape_md(text: str) -> str:
+    return _MD_ESC.sub(r'\\\1', text)
+
+def send_message(msg: str) -> Tuple[bool, Any]:
+    """
+    Envia uma mensagem para o Telegram usando MarkdownV2.
+    Retorna (ok: bool, info: dict|str)
+    """
+    if not TOKEN or not CHAT_ID:
+        return False, "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não configurados"
+
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": escape_md(msg),
+        "parse_mode": "MarkdownV2",
+        "disable_web_page_preview": True,
+    }
     try:
-        r = requests.post(url, json=payload, timeout=15)
-        print(f"[telegram] {r.status_code} {r.text}")
-        return r.ok
+        r = requests.post(url, data=payload, timeout=15)
+        if r.status_code == 200:
+            return True, r.json()
+        return False, f"HTTP {r.status_code}: {r.text}"
     except Exception as e:
-        print(f"[telegram] EXC {e}")
-        return False
+        return False, f"EXC: {e}"
