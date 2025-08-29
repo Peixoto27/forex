@@ -45,11 +45,12 @@ class ForexDataCollector:
                 range_param = "3mo"
             else:
                 range_param = "6mo"
-            
+           interval = "60m"  # sempre velas de 1 hora
+        
             response = self.api_client.call_api('YahooFinance/get_stock_chart', query={
                 'symbol': symbol,
                 'region': 'US',
-                'interval': '1h',  # Dados horários para Forex
+                'interval': interval,  # Dados horários para Forex
                 'range': range_param,
                 'includeAdjustedClose': True
             })
