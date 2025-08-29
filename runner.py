@@ -96,7 +96,25 @@ def run_once() -> Dict[str, Any]:
             score = float(pred.get("score", 0.0))
             signal = pred.get("signal", "HOLD")
             price = pred.get("price")
+            from telegram_utils import send_telegram_alert
 
+# ...
+score = float(pred.get("score", 0.0))
+signal = pred.get("signal", "HOLD")
+price = pred.get("price")
+
+# critério de envio
+if signal != "HOLD" and score >= float(os.getenv("CONF_THRESHOLD", 60)):
+    send_telegram_alert({
+        "symbol": sym_out,
+        "side": signal,
+        "price": price,
+        "confidence": score,
+        "take_profit": pred.get("take_profit"),
+        "stop_loss": pred.get("stop_loss"),
+        "time": pred.get("time"),
+    })
+    
             log.info("%s: price=%s score=%.3f thr=%.2f -> %s", sym_out, price, score, CONF_THRESHOLD, signal)
 
             # guarda para JSON final
