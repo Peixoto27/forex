@@ -3,15 +3,17 @@
 Preditor com envio de alertas (1 mensagem por par).
 - Coleta via yfinance (PERIOD, INTERVAL)
 - Calcula features (SMA/RSI) + ATR
-- IA: usa modelo/scaler se existir; senão, heurística robusta
+- IA: usa modelo/scaler se existir; senão, heurística contínua com probabilidades variadas
 - Envia Telegram por par com ATR, prob. buy/sell, confiança e hora UTC
 - Filtro por confiança (CONF_THRESHOLD = 0.65 ou 65)
 - Anti-duplicados por símbolo (muda side/TP/SL ou cooldown)
 """
 
 import os
+import re
 import json
 import logging
+from time import time
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple
 
@@ -24,7 +26,7 @@ try:
 except Exception:
     joblib = None
 
-from notifier_telegram import send_message
+from notifier_telegram import send_message  # retorna (ok, info)
 
 # ---------------- Config ----------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -41,7 +43,7 @@ INTERVAL = os.getenv("INTERVAL", "60m").strip()  # ex.: 60m
 _thr = os.getenv("CONF_THRESHOLD", "0.65")
 try:
     CONF_THRESHOLD = float(_thr)
-    if CONF_THRESHOLD > 1.0:
+    if CONF_THRESHOLD > 1.0:  # aceita 65 -> 0.65
         CONF_THRESHOLD /= 100.0
 except Exception:
     CONF_THRESHOLD = 0.65
@@ -49,8 +51,8 @@ except Exception:
 COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "30"))  # anti-duplicados
 LAST_SENT_FILE = os.getenv("LAST_SENT_FILE", "last_sent.json")
 
-MODEL_PATH  = os.getenv("MODEL_PATH", "forex_model.pkl")
-SCALER_PATH = os.getenv("SCALER_PATH", "forex_scaler.pkl")
+MODEL_PATH  = os.getenv("MODEL_PATH", "forex_model.pkl").strip()
+SCALER_PATH = os.getenv("SCALER_PATH", "forex_scaler.pkl").strip()
 
 # -------------- Utils --------------
 def _utc_now_str() -> str:
@@ -78,6 +80,7 @@ def _fmt(x, nd=5) -> str:
 
 # -------------- Data --------------
 def fetch_ohlc(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    log.debug(f"[fetch] {symbol} period={period} interval={interval}")
     df = yf.download(
         tickers=symbol,
         period=period,
@@ -110,7 +113,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return feat
 
 def calc_atr(df: pd.DataFrame, n: int = 14) -> float:
-    # ATR simples baseado em High/Low (sem True Range completo por simplicidade/robustez)
+    # ATR simples baseado em High/Low (robusto)
     try:
         atr = (df["high"].tail(n).max() - df["low"].tail(n).min()) / float(n)
         return float(atr)
@@ -119,64 +122,144 @@ def calc_atr(df: pd.DataFrame, n: int = 14) -> float:
 
 # -------------- Model --------------
 def load_pipeline() -> Tuple[Any, Any]:
+    """
+    Carrega scaler e modelo, com logs detalhados (cwd, listdir e paths).
+    """
     scl = mdl = None
-    if joblib:
-        try:
-            if os.path.exists(SCALER_PATH):
-                scl = joblib.load(SCALER_PATH)
-                log.info(f"[model] scaler carregado: {SCALER_PATH}")
-            if os.path.exists(MODEL_PATH):
-                mdl = joblib.load(MODEL_PATH)
-                log.info(f"[model] modelo carregado: {MODEL_PATH}")
-        except Exception as e:
-            log.warning(f"[model] falha ao carregar: {e}")
-    else:
-        log.info("[model] joblib indisponível, usando heurística")
+    cwd = os.getcwd()
+    try:
+        files = os.listdir(cwd)
+    except Exception:
+        files = []
+    log.info(f"[model] cwd={cwd}")
+    log.info(f"[model] files_here={files}")
+    log.info(f"[model] SCALER_PATH={SCALER_PATH} | MODEL_PATH={MODEL_PATH}")
+
+    if not joblib:
+        log.warning("[model] joblib indisponível -> sem modelo (usará heurística).")
+        return None, None
+
+    try:
+        if os.path.exists(SCALER_PATH):
+            scl = joblib.load(SCALER_PATH)
+            log.info(f"[model] scaler carregado: {SCALER_PATH}")
+        else:
+            log.warning(f"[model] scaler não encontrado: {SCALER_PATH}")
+
+        if os.path.exists(MODEL_PATH):
+            mdl = joblib.load(MODEL_PATH)
+            attrs = {
+                "has_predict_proba": hasattr(mdl, "predict_proba"),
+                "has_classes_": hasattr(mdl, "classes_"),
+                "type": type(mdl).__name__,
+            }
+            log.info(f"[model] modelo carregado: {MODEL_PATH} | {attrs}")
+            if hasattr(mdl, "classes_"):
+                try:
+                    log.info(f"[model] classes_={list(mdl.classes_)}")
+                except Exception:
+                    log.info("[model] classes_ disponível")
+        else:
+            log.warning(f"[model] modelo não encontrado: {MODEL_PATH}")
+
+    except Exception as e:
+        log.exception(f"[model] falha ao carregar modelo/scaler: {e}")
+        return scl, None
+
     return scl, mdl
 
 SCALER, MODEL = load_pipeline()
 
 def infer_prob_signal(x_row: np.ndarray) -> Tuple[str, float, float]:
     """
-    Retorna (side, prob_buy, prob_sell) com modelo se existir, senão heurística.
+    Retorna (side, prob_buy, prob_sell).
+    - Se houver SCALER/MODEL, usa predict_proba com mapeamento por classes_.
+    - Caso contrário, usa heurística contínua (probabilidades variam).
     """
+    X = x_row
     if SCALER is not None:
         try:
-            x_row = SCALER.transform(x_row)
+            X = SCALER.transform(X)
         except Exception as e:
             log.warning(f"[scale] falha: {e}")
 
     if MODEL is not None:
         try:
-            if hasattr(MODEL, "predict_proba"):
-                proba = MODEL.predict_proba(x_row)[0]
-                if len(proba) == 1:
-                    pb = float(proba[0])
-                    ps = 1 - pb
+            # Probabilidades com ordem correta das classes
+            if hasattr(MODEL, "predict_proba") and hasattr(MODEL, "classes_"):
+                proba = MODEL.predict_proba(X)[0]
+                classes = list(MODEL.classes_)
+                pb = ps = 0.5
+
+                # Caso comum: classes são [0,1] ou [1,0] (inteiros)
+                if any(isinstance(c, (int, np.integer)) for c in classes):
+                    # assumimos 1 = BUY, 0 = SELL (ajuste se seu treino for diferente)
+                    if 1 in classes and 0 in classes:
+                        i_buy = classes.index(1)
+                        i_sell = classes.index(0)
+                        pb = float(proba[i_buy])
+                        ps = float(proba[i_sell])
+                    else:
+                        # fallback: usa a última coluna como BUY
+                        pb = float(proba[-1])
+                        ps = 1.0 - pb
                 else:
-                    pb = float(proba[1])
-                    ps = float(proba[0])
-                side = "BUY" if pb >= 0.5 else "SELL"
+                    # classes de texto, ex.: ['SELL', 'BUY']
+                    try:
+                        i_buy = classes.index("BUY")
+                        i_sell = classes.index("SELL")
+                        pb = float(proba[i_buy])
+                        ps = float(proba[i_sell])
+                    except Exception:
+                        pb = float(proba[-1])
+                        ps = 1.0 - pb
+
+                side = "BUY" if pb >= ps else "SELL"
+                log.debug(f"[model] proba -> pb={pb:.4f} ps={ps:.4f} side={side}")
                 return side, pb, ps
-            else:
-                pred = int(MODEL.predict(x_row)[0])
-                side = "BUY" if pred == 1 else "SELL"
-                pb = 0.65 if side == "BUY" else 0.35
+
+            # Sem predict_proba mas com predict
+            if hasattr(MODEL, "predict"):
+                pred = MODEL.predict(X)[0]
+                try:
+                    pred_int = int(pred)
+                    side = "BUY" if pred_int == 1 else "SELL"
+                except Exception:
+                    pred_str = str(pred).upper()
+                    side = "BUY" if "BUY" in pred_str else "SELL"
+                pb = 0.60 if side == "BUY" else 0.40
                 ps = 1 - pb
                 return side, pb, ps
-        except Exception as e:
-            log.warning(f"[model] falha na inferência: {e}")
 
-    # heurística fallback (SMA cruzada + RSI zona)
-    # x_row segue a ordem de build_features: [close, ret1, sma10, sma20, rsi14]
+        except Exception as e:
+            log.exception(f"[model] erro na inferência com modelo: {e}")
+            # cai para heurística abaixo
+
+    # -------- Heurística contínua (probabilidades variadas) --------
     try:
+        # x_row segue a ordem de build_features: [close, ret1, sma10, sma20, rsi14]
         close, ret1, sma10, sma20, rsi14 = map(float, x_row[0])
+        dist = abs(sma10 - sma20) / max(close, 1e-9)
+        # força do sinal 0..1 (tuning leve)
+        strength = max(0.0, min(1.0, dist * 800.0))
+        # boost se RSI em zona mais “decidida”
+        rsi_boost = 0.0
+        if rsi14 < 30 or rsi14 > 70:
+            rsi_boost = 0.15
+        strength = max(0.0, min(1.0, strength + rsi_boost))
+
         if sma10 > sma20 and rsi14 < 70:
-            return "BUY", 0.75, 0.25
+            pb = 0.55 + 0.45 * strength   # 55%..100%
+            ps = 1 - pb
+            side = "BUY"
         elif sma10 < sma20 and rsi14 > 30:
-            return "SELL", 0.25, 0.75
+            ps = 0.55 + 0.45 * strength
+            pb = 1 - ps
+            side = "SELL"
         else:
-            return "HOLD", 0.5, 0.5
+            side = "HOLD"
+            pb = ps = 0.5
+        return side, pb, ps
     except Exception:
         return "HOLD", 0.5, 0.5
 
@@ -207,7 +290,7 @@ def predict_symbol(symbol: str) -> Dict[str, Any]:
     conf = max(pb, ps)  # 0..1
     ok = side in ("BUY", "SELL") and conf >= CONF_THRESHOLD
 
-    return {
+    sig = {
         "symbol": symbol,
         "side": side,
         "price": price,
@@ -221,8 +304,11 @@ def predict_symbol(symbol: str) -> Dict[str, Any]:
         "time": _utc_now_str(),
         "model": "AI" if MODEL is not None else "Heuristic",
     }
+    log.debug(f"[signal] {symbol} -> {sig}")
+    return sig
 
 def format_msg(sig: Dict[str, Any]) -> str:
+    # vamos usar MarkdownV2 no Telegram (escape acontece no notifier)
     return (
         "💱 **FOREX AI SIGNAL**\n"
         f"**{sig['symbol']}** → **{sig['side']}**\n"
@@ -240,7 +326,6 @@ def _key(sig: Dict[str, Any]) -> str:
     return f"{sig['symbol']}|{sig['side']}|{_fmt(sig['take_profit'])}|{_fmt(sig['stop_loss'])}"
 
 def _can_send(sig: Dict[str, Any], cache: dict) -> bool:
-    from time import time
     k = _key(sig)
     rec = cache.get(k)
     if rec is None:
@@ -250,7 +335,6 @@ def _can_send(sig: Dict[str, Any], cache: dict) -> bool:
     return (time() - last_ts) >= (COOLDOWN_MIN * 60)
 
 def _mark_sent(sig: Dict[str, Any], cache: dict) -> None:
-    from time import time
     k = _key(sig)
     cache[k] = {"ts": time()}
 
@@ -297,5 +381,4 @@ def predict_last(symbols: List[str] = None,
             log.error(f"[predict_last] erro com {sym}: {e}")
 
     _save_json(LAST_SENT_FILE, cache)
-
     return {"success": True, "signals": signals, "updated": updated}
